@@ -1,0 +1,10 @@
+{
+  "description": "Monitor and manage waste and resource data in real-time for communities in Tanzania, enhancing sustainability through IoT integration and data visualization.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

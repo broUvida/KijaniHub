@@ -3,6 +3,7 @@ import DashboardLayout from "./layouts/DashboardLayout";
 import LandingPage from "./pages/LandingPage";
 import Login from "./pages/Login";
 import SignUp from "./pages/SignUp";
+import ResetPassword from "./pages/ResetPassword";
 import Dashboard from "./pages/Dashboard";
 import WasteTracking from "./pages/WasteTracking";
 import BSFMonitoring from "./pages/BSFMonitoring";
@@ -13,6 +14,7 @@ import MapView from "./pages/MapView";
 import AdminPanel from "./pages/AdminPanel";
 import Community from "./pages/Community";
 import Marketplace from "./pages/MarketPlace";
+import { PhotoCheck } from "./pages/PhotoCheck";
 import NotFound from "./pages/NotFound";
 
 export const router = createBrowserRouter([
@@ -29,6 +31,10 @@ export const router = createBrowserRouter([
     Component: SignUp,
   },
   {
+    path: "/reset-password",
+    Component: ResetPassword,
+  },
+  {
     path: "/dashboard",
     Component: DashboardLayout,
     children: [
@@ -39,6 +45,7 @@ export const router = createBrowserRouter([
       { path: "biogas", Component: BiogasTracking },
       { path: "wash", Component: WASHMonitoring },
       { path: "map", Component: MapView },
+      { path: "photo-check", Component: PhotoCheck },
       { path: "community", Component: Community },
       { path: "marketplace", Component: Marketplace },
       { path: "admin", Component: AdminPanel },

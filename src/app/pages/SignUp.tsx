@@ -2,39 +2,57 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate, Link } from 'react-router';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { useApp, Member, MemberType } from '../context/AppContext';
+import { useApp, MemberType } from '../context/AppContext';
+import { supabase } from '../lib/supabase';
 import {
-  Leaf, Landmark, User, Users, Mail, Phone, Lock, MapPin, Linkedin,
-  MessageCircle, Camera, LocateFixed, AlertCircle, ArrowLeft, CheckCircle,
+  Leaf, Landmark, User, Users, Camera, LocateFixed, AlertCircle, ChevronLeft, ChevronRight, Check, MailCheck, CheckCircle2,
 } from 'lucide-react';
 
 /**
- * SignUp - Registration for Municipal Councils, Individual Volunteers,
- * and Volunteer Groups (CSOs / NGOs).
- * Location is MANDATORY: every member drops a pin on the map, and their
- * office / position immediately appears on the KijaniSense map view.
+ * SignUp — Apple-style registration for municipal councils, individual volunteers
+ * and volunteer groups (CSOs / NGOs).
+ * Location is required: every member drops a pin, and appears on the KijaniSense map.
  */
 
-const ACCOUNT_TYPES: { id: MemberType; icon: any; title: string; desc: string }[] = [
+const SYSTEM_FONT =
+  '-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+const C = {
+  label: '#1D1D1F',
+  secondary: '#6E6E73',
+  tertiary: '#8E8E93',
+  separator: '#E5E5EA',
+  tint: '#1E8A5A',
+  green: '#248A3D',
+  red: '#E0352B',
+};
+
+const ACCOUNT_TYPES: { id: MemberType; icon: typeof Landmark; title: string; desc: string }[] = [
   {
     id: 'municipal_council',
     icon: Landmark,
-    title: 'Municipal Council',
-    desc: 'Register your council office. It will appear on the network map and gain access to ward-level waste data.',
+    title: 'Municipal council',
+    desc: 'Register your council office. It appears on the network map and gets ward-level waste data.',
   },
   {
     id: 'volunteer_individual',
     icon: User,
-    title: 'Volunteer — Individual',
-    desc: 'Join as an individual volunteer. Share your location, build your profile and take part in collections and campaigns.',
+    title: 'Individual volunteer',
+    desc: 'Take part in collections and campaigns, and build your volunteer profile.',
   },
   {
     id: 'volunteer_group',
     icon: Users,
-    title: 'Volunteer — Group (CSO / NGO)',
-    desc: 'Register your organization so your members can operate under one banner and partner with Kijani Hub.',
+    title: 'Volunteer group (CSO or NGO)',
+    desc: 'Register your organisation so your members can work together under one name.',
   },
 ];
+
+const FORM_COPY: Record<MemberType, { heading: string; nameLabel: string; namePlaceholder: string; locationLabel: string }> = {
+  municipal_council: { heading: 'Register your council', nameLabel: 'Council', namePlaceholder: 'Ilala Municipal Council', locationLabel: 'Office location' },
+  volunteer_individual: { heading: 'Join as a volunteer', nameLabel: 'Full name', namePlaceholder: 'Amina Hassan', locationLabel: 'Your location' },
+  volunteer_group: { heading: 'Register your organisation', nameLabel: 'Organisation', namePlaceholder: 'Green Youth Initiative', locationLabel: 'Organisation location' },
+};
 
 /** Compress an uploaded image to a small square data URL for the profile */
 const fileToDataUrl = (file: File): Promise<string> =>
@@ -61,9 +79,11 @@ const fileToDataUrl = (file: File): Promise<string> =>
     reader.readAsDataURL(file);
   });
 
+const inputClass = 'flex-1 min-w-0 h-11 bg-transparent text-[17px] outline-none placeholder:text-[#A1A1A6]';
+
 export default function SignUp() {
   const navigate = useNavigate();
-  const { addMember, setUserRole, setIsAuthenticated } = useApp();
+  const { refreshSession } = useApp();
 
   const [accountType, setAccountType] = useState<MemberType | null>(null);
   const [form, setForm] = useState({
@@ -81,16 +101,23 @@ export default function SignUp() {
   const [pin, setPin] = useState<{ lat: number; lng: number } | null>(null);
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
+  const [sentTo, setSentTo] = useState<string | null>(null);   // email the confirmation link went to
+  const [resend, setResend] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [locating, setLocating] = useState(false);              // finding the device's position
+  const [accuracy, setAccuracy] = useState<number | null>(null); // metres, when the pin came from GPS
 
   // ── Location picker map ──
   const mapDivRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const markerRef = useRef<L.Marker | null>(null);
+  const watchIdRef = useRef<number | null>(null);
+  const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const accuracyCircleRef = useRef<L.Circle | null>(null);
 
   const pinIcon = L.icon({
     iconUrl: `data:image/svg+xml;base64,${btoa(`
       <svg xmlns="http://www.w3.org/2000/svg" width="32" height="40" viewBox="0 0 32 40">
-        <path fill="#059669" stroke="#fff" stroke-width="2" d="M16 0C7.163 0 0 7.163 0 16c0 11 16 24 16 24s16-13 16-24c0-8.837-7.163-16-16-16z"/>
+        <path fill="${C.tint}" stroke="#fff" stroke-width="2" d="M16 0C7.163 0 0 7.163 0 16c0 11 16 24 16 24s16-13 16-24c0-8.837-7.163-16-16-16z"/>
         <circle cx="16" cy="16" r="6" fill="#fff"/>
       </svg>
     `)}`,
@@ -98,48 +125,123 @@ export default function SignUp() {
     iconAnchor: [16, 40],
   });
 
-  const placePin = (lat: number, lng: number) => {
+  const clearAccuracy = () => {
+    accuracyCircleRef.current?.remove();
+    accuracyCircleRef.current = null;
+    setAccuracy(null);
+  };
+
+  /** Put the pin at a spot. fromGps=false means the person placed it themselves (exact). */
+  const placePin = (lat: number, lng: number, fromGps = false) => {
     setPin({ lat, lng });
+    setError('');
+    if (!fromGps) clearAccuracy();
     const map = mapRef.current;
     if (!map) return;
     if (markerRef.current) {
       markerRef.current.setLatLng([lat, lng]);
     } else {
-      markerRef.current = L.marker([lat, lng], { icon: pinIcon }).addTo(map);
+      const marker = L.marker([lat, lng], { icon: pinIcon, draggable: true, autoPan: true }).addTo(map);
+      // Dragging the pin fine-tunes it to the exact spot
+      marker.on('dragend', () => {
+        const p = marker.getLatLng();
+        stopLocating();
+        clearAccuracy();
+        setPin({ lat: p.lat, lng: p.lng });
+      });
+      markerRef.current = marker;
     }
   };
 
   useEffect(() => {
     if (!accountType || !mapDivRef.current || mapRef.current) return;
     const map = L.map(mapDivRef.current).setView([-6.8, 39.25], 12); // Dar es Salaam
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap contributors',
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       maxZoom: 19,
+      // OpenStreetMap blocks map requests that don't say which site they come from
+      referrerPolicy: 'strict-origin-when-cross-origin',
     }).addTo(map);
     map.on('click', (e: L.LeafletMouseEvent) => placePin(e.latlng.lat, e.latlng.lng));
     mapRef.current = map;
     setTimeout(() => map.invalidateSize(), 200);
     return () => {
+      stopLocating();
       map.remove();
       mapRef.current = null;
       markerRef.current = null;
+      accuracyCircleRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountType]);
 
+  const stopLocating = () => {
+    if (watchIdRef.current !== null) navigator.geolocation?.clearWatch(watchIdRef.current);
+    watchIdRef.current = null;
+    if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+    stopTimerRef.current = null;
+    setLocating(false);
+  };
+
+  /**
+   * Ask the device for a precise position and keep refining for up to 20 seconds.
+   * Phones usually get within ~20 m outdoors; laptops guess from Wi-Fi and can be far off.
+   */
   const useMyLocation = () => {
-    if (!navigator.geolocation) {
-      setError('Your browser does not support location. Please tap the map to drop a pin instead.');
+    setError('');
+    if (!('geolocation' in navigator)) {
+      setError('This browser can’t share your location. Tap the map or drag the pin instead.');
       return;
     }
-    navigator.geolocation.getCurrentPosition(
+    if (!window.isSecureContext) {
+      setError('Location only works on a secure (https) page. Tap the map instead.');
+      return;
+    }
+    stopLocating();
+    setLocating(true);
+    let bestAccuracy = Infinity;
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
       (pos) => {
-        placePin(pos.coords.latitude, pos.coords.longitude);
-        mapRef.current?.setView([pos.coords.latitude, pos.coords.longitude], 15);
+        const { latitude, longitude, accuracy: acc } = pos.coords;
+        if (acc >= bestAccuracy) return; // keep the most precise reading
+        bestAccuracy = acc;
+        placePin(latitude, longitude, true);
+        setAccuracy(Math.round(acc));
+        const map = mapRef.current;
+        if (map) {
+          accuracyCircleRef.current?.remove();
+          accuracyCircleRef.current = L.circle([latitude, longitude], {
+            radius: acc, color: C.tint, weight: 1, fillColor: C.tint, fillOpacity: 0.12, interactive: false,
+          }).addTo(map);
+          const zoom = acc <= 50 ? 17 : acc <= 250 ? 16 : acc <= 1000 ? 14 : 13;
+          map.setView([latitude, longitude], zoom);
+        }
+        if (acc <= 25) stopLocating(); // precise enough
       },
-      () => setError('Could not read your location. Please tap the map to drop a pin instead.')
+      (err) => {
+        const hadFix = bestAccuracy !== Infinity;
+        // A passing hiccup (no signal for a moment, slow reading) after a good reading: keep refining
+        if (hadFix && err.code !== 1) return;
+        stopLocating();
+        if (hadFix) return; // location was switched off, but we keep the reading we have
+        const inPreview = window.self !== window.top;
+        setError(
+          err.code === 1
+            ? inPreview
+              ? 'Location is blocked inside this preview window. Open your published site to use it, or tap the map.'
+              : 'Location access is off for this site. Allow it in your browser’s site settings, or tap the map.'
+            : err.code === 3
+              ? 'Finding your location took too long. Try again near a window or outdoors, or tap the map.'
+              : 'Your device couldn’t work out where it is. Tap the map or drag the pin instead.'
+        );
+      },
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
     );
+    stopTimerRef.current = setTimeout(stopLocating, 20000); // stop refining after 20 s
   };
+
+  const formatAccuracy = (m: number) => (m < 1000 ? `${m} m` : `${(m / 1000).toFixed(1)} km`);
 
   const handlePhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -147,7 +249,7 @@ export default function SignUp() {
     try {
       setPhoto(await fileToDataUrl(file));
     } catch {
-      setError('Could not read that image — please try a different photo.');
+      setError('We couldn’t read that image. Try a different photo.');
     }
   };
 
@@ -158,293 +260,357 @@ export default function SignUp() {
     e.preventDefault();
     setError('');
 
-    // Location is mandatory for every account type
+    // Location is required for every account type
     if (!pin) {
-      setError('Location is required — tap the map to drop a pin, or use "Use my current location".');
+      setError('Add your location: tap the map to drop a pin, or use your current location.');
       return;
     }
     if (!form.address.trim()) {
-      setError('Please enter your street / area address.');
+      setError('Add your street or area address.');
       return;
     }
 
     setSaving(true);
-
-    const member: Member = {
-      id: `member-${Date.now()}`,
-      accountType: accountType!,
-      name: form.name.trim(),
-      contactPerson: isOrg ? form.contactPerson.trim() : undefined,
-      email: form.email.trim(),
-      phone: form.phone.trim(),
-      whatsapp: form.whatsapp.trim() || undefined,
-      linkedin: isVolunteer && form.linkedin.trim() ? form.linkedin.trim() : undefined,
-      photo: photo || undefined,
-      location: {
-        lat: Math.round(pin.lat * 100000) / 100000,
-        lng: Math.round(pin.lng * 100000) / 100000,
-        address: form.address.trim(),
-        ward: form.ward.trim() || undefined,
-      },
-      createdAt: new Date().toISOString(),
-      lastSeen: new Date().toISOString(),
-    };
+    const email = form.email.trim();
 
     try {
-      await addMember(member);
-    } catch (e) {
-      console.warn('addMember error:', e);
+      const { data, error: signUpError } = await supabase.auth.signUp({
+        email,
+        password: form.password,
+        options: {
+          emailRedirectTo: `${window.location.origin}/login?confirmed=1`,
+          // The database turns this into the person's profile and map pin
+          data: {
+            account_type: accountType,
+            full_name: form.name.trim(),
+            member: {
+              id: `member-${Date.now()}`,
+              name: form.name.trim(),
+              contact_person: isOrg ? form.contactPerson.trim() : '',
+              phone: form.phone.trim(),
+              whatsapp: form.whatsapp.trim(),
+              linkedin: isVolunteer ? form.linkedin.trim() : '',
+              lat: Math.round(pin.lat * 100000) / 100000,
+              lng: Math.round(pin.lng * 100000) / 100000,
+              address: form.address.trim(),
+              ward: form.ward.trim(),
+            },
+          },
+        },
+      });
+
+      if (signUpError) {
+        const m = signUpError.message.toLowerCase();
+        setError(
+          m.includes('already registered') ? 'An account with this email already exists. Sign in instead.'
+          : m.includes('password') ? 'Choose a stronger password: at least 6 characters.'
+          : m.includes('rate limit') || m.includes('too many') ? 'Too many sign-ups right now. Wait a few minutes, then try again.'
+          : m.includes('fetch') || m.includes('network') ? 'We couldn’t reach the server. Check your connection and try again.'
+          : m.includes('sending') && m.includes('email') ? 'We couldn’t send your confirmation email just now. Please try again in a few minutes. If it keeps happening, contact kijanihubtz@gmail.com.'
+          : signUpError.message
+        );
+        setSaving(false);
+        return;
+      }
+
+      // Supabase hides whether an email is taken: an existing account comes back with no identities
+      if (data.user && data.user.identities && data.user.identities.length === 0) {
+        setError('An account with this email already exists. Sign in instead.');
+        setSaving(false);
+        return;
+      }
+
+      // The photo is uploaded on first sign-in (it's too large to send with the sign-up)
+      if (photo) localStorage.setItem('kijani-pending-photo', JSON.stringify({ email, photo }));
+
+      if (data.session) {
+        // Email confirmation is switched off in Supabase: they're signed in already
+        await refreshSession();
+        navigate('/dashboard/map');
+        return;
+      }
+
+      setSentTo(email);
+      setSaving(false);
+    } catch (err) {
+      setError('We couldn’t reach the server. Check your connection and try again.');
+      setSaving(false);
     }
-
-    // Sign the new member in with an appropriate dashboard role
-    const role = accountType === 'municipal_council' ? 'regional_manager' : 'volunteer';
-    setUserRole(role as any);
-    setIsAuthenticated(true);
-    localStorage.setItem('userRole', role);
-    localStorage.setItem('isAuthenticated', 'true');
-    localStorage.setItem('userName', member.name);
-
-    navigate('/dashboard/map'); // land on the map so they see themselves on it
   };
+
+  const resendEmail = async () => {
+    if (!sentTo) return;
+    setResend('sending');
+    try {
+      const { error: resendError } = await supabase.auth.resend({
+        type: 'signup',
+        email: sentTo,
+        options: { emailRedirectTo: `${window.location.origin}/login?confirmed=1` },
+      });
+      setResend(resendError ? 'error' : 'sent');
+    } catch {
+      setResend('error');
+    }
+  };
+
+  const set = (key: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setForm({ ...form, [key]: e.target.value });
+
+  // ── Done: confirmation email sent ──
+  if (sentTo) {
+    return (
+      <Shell back={{ label: 'Kijani Hub', to: '/' }}>
+        <div className="text-center pt-6">
+          <span className="inline-flex w-16 h-16 rounded-full items-center justify-center" style={{ background: 'rgba(30,138,90,0.12)' }}>
+            <MailCheck size={32} style={{ color: C.tint }} />
+          </span>
+          <h1 className="mt-5 text-[28px] leading-tight font-semibold tracking-[-0.02em]">Check your email</h1>
+          <p className="mt-3 text-[17px] leading-[1.45] text-balance" style={{ color: C.secondary }}>
+            We sent a confirmation link to <span style={{ color: C.label }}>{sentTo}</span>. Tap it to finish creating your account, and your pin will appear on the map.
+          </p>
+        </div>
+
+        <Link
+          to="/login"
+          className="mt-8 w-full h-12 rounded-xl text-[17px] font-semibold text-white flex items-center justify-center"
+          style={{ background: C.tint }}
+        >
+          Go to sign in
+        </Link>
+
+        <div className="mt-6 text-center text-[15px]" style={{ color: C.secondary }}>
+          {resend === 'sent' ? (
+            <p className="inline-flex items-center gap-1.5" style={{ color: C.green }}><CheckCircle2 size={16} /> Sent again. Check your inbox.</p>
+          ) : (
+            <p>
+              Didn’t get it? Check your spam folder, or{' '}
+              <button type="button" onClick={resendEmail} disabled={resend === 'sending'} style={{ color: C.tint }}>
+                {resend === 'sending' ? 'sending…' : 'send it again'}
+              </button>
+              .
+            </p>
+          )}
+          {resend === 'error' && (
+            <p className="mt-2 text-[13px]" style={{ color: C.red }}>We couldn’t resend it. Wait a minute and try again.</p>
+          )}
+        </div>
+      </Shell>
+    );
+  }
 
   // ── STEP 1: choose account type ──
   if (!accountType) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-emerald-50 via-blue-50 to-emerald-100 flex items-center justify-center p-4">
-        <div className="max-w-3xl w-full">
-          <div className="text-center mb-10">
-            <div className="flex justify-center mb-4">
-              <div className="bg-emerald-600 p-4 rounded-2xl shadow-lg">
-                <Leaf className="text-white" size={40} />
-              </div>
-            </div>
-            <h1 className="text-3xl font-bold text-gray-800 mb-2">Join the Kijani Hub network</h1>
-            <p className="text-gray-600">Choose how you want to sign up. Every member appears on the network map.</p>
-          </div>
-          <div className="grid md:grid-cols-3 gap-5">
+      <Shell back={{ label: 'Kijani Hub', to: '/' }}>
+        <div className="text-center">
+          <span className="inline-flex w-16 h-16 rounded-[16px] items-center justify-center" style={{ background: C.tint }}>
+            <Leaf size={34} className="text-white" strokeWidth={2} />
+          </span>
+          <h1 className="mt-5 text-[28px] leading-tight font-semibold tracking-[-0.02em]">Join KijaniSense</h1>
+          <p className="mt-2 text-[15px] text-balance" style={{ color: C.secondary }}>
+            Choose how you’d like to take part. Every member appears on the network map.
+          </p>
+        </div>
+
+        <div className="mt-8 bg-white rounded-xl overflow-hidden">
+          <div className="pl-4 divide-y divide-[#E5E5EA]">
             {ACCOUNT_TYPES.map((t) => (
               <button
                 key={t.id}
+                type="button"
                 onClick={() => setAccountType(t.id)}
-                className="bg-white rounded-2xl shadow-md p-6 text-left hover:shadow-xl hover:-translate-y-1 transition-all border-2 border-transparent hover:border-emerald-500"
+                className="w-full flex items-center gap-3 pr-3 py-3 text-left hover:bg-black/[0.02] active:bg-black/[0.05]"
               >
-                <t.icon className="text-emerald-600" size={28} />
-                <h3 className="font-bold text-gray-800 mt-4">{t.title}</h3>
-                <p className="text-sm text-gray-500 mt-2">{t.desc}</p>
+                <span className="w-9 h-9 rounded-[9px] flex-shrink-0 flex items-center justify-center" style={{ background: C.tint }}>
+                  <t.icon size={19} className="text-white" strokeWidth={2} />
+                </span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-[17px]">{t.title}</p>
+                  <p className="text-[13px] leading-[1.35]" style={{ color: C.secondary }}>{t.desc}</p>
+                </div>
+                <ChevronRight size={18} className="flex-shrink-0" style={{ color: '#C4C4C7' }} />
               </button>
             ))}
           </div>
-          <p className="text-center text-sm text-gray-600 mt-8">
-            Already have an account?{' '}
-            <Link to="/login" className="text-emerald-700 font-semibold hover:underline">Sign in</Link>
-          </p>
         </div>
-      </div>
+
+        <p className="mt-8 text-center text-[15px]" style={{ color: C.secondary }}>
+          Already have an account?{' '}
+          <Link to="/login" style={{ color: C.tint }}>Sign in</Link>
+        </p>
+      </Shell>
     );
   }
 
-  // ── STEP 2: details + mandatory location ──
-  const typeMeta = ACCOUNT_TYPES.find((t) => t.id === accountType)!;
+  // ── STEP 2: details + required location ──
+  const copy = FORM_COPY[accountType];
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-emerald-50 via-blue-50 to-emerald-100 py-10 px-4">
-      <div className="max-w-2xl mx-auto">
-        <button
-          onClick={() => setAccountType(null)}
-          className="inline-flex items-center gap-2 text-sm text-gray-600 hover:text-emerald-700 mb-5"
-        >
-          <ArrowLeft size={16} /> Change account type
-        </button>
+    <Shell back={{ label: 'Account type', onClick: () => { setAccountType(null); setPin(null); setError(''); } }}>
+      <h1 className="px-1 text-[28px] leading-tight font-semibold tracking-[-0.02em]">{copy.heading}</h1>
+      <p className="px-1 mt-1.5 text-[15px]" style={{ color: C.secondary }}>
+        It takes about two minutes. You can update your details later.
+      </p>
 
-        <div className="bg-white rounded-2xl shadow-xl p-8">
-          <div className="flex items-center gap-3 mb-1">
-            <typeMeta.icon className="text-emerald-600" size={24} />
-            <h1 className="text-2xl font-bold text-gray-800">{typeMeta.title} sign up</h1>
-          </div>
-          <p className="text-sm text-gray-500 mb-7">
-            Fields marked <span className="text-red-500">*</span> are required. Your location will be shown on the KijaniSense network map.
-          </p>
+      <form onSubmit={handleSubmit} className="mt-7 space-y-7">
+        {/* Identity */}
+        <Group>
+          <Field label={copy.nameLabel} htmlFor="name">
+            <input id="name" required value={form.name} onChange={set('name')} placeholder={copy.namePlaceholder} className={inputClass} autoComplete={accountType === 'volunteer_individual' ? 'name' : 'organization'} />
+          </Field>
+          {isOrg && (
+            <Field label="Contact person" htmlFor="contactPerson">
+              <input id="contactPerson" required value={form.contactPerson} onChange={set('contactPerson')} placeholder="Full name" className={inputClass} autoComplete="name" />
+            </Field>
+          )}
+        </Group>
 
-          <form onSubmit={handleSubmit} className="space-y-5">
-            {/* Name */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                {accountType === 'municipal_council' ? 'Council / office name' : accountType === 'volunteer_group' ? 'Organization name (CSO / NGO)' : 'Full name'} <span className="text-red-500">*</span>
-              </label>
-              <input
-                required
-                value={form.name}
-                onChange={(e) => setForm({ ...form, name: e.target.value })}
-                className="block w-full px-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                placeholder={accountType === 'municipal_council' ? 'e.g. Ilala Municipal Council' : accountType === 'volunteer_group' ? 'e.g. Green Youth Initiative' : 'e.g. Amina Hassan'}
-              />
-            </div>
+        {/* Account */}
+        <Group header="Account">
+          <Field label="Email" htmlFor="email">
+            <input id="email" type="email" required value={form.email} onChange={set('email')} placeholder="name@example.org" className={inputClass} autoComplete="email" />
+          </Field>
+          <Field label="Password" htmlFor="password">
+            <input id="password" type="password" required minLength={6} value={form.password} onChange={set('password')} placeholder="At least 6 characters" className={inputClass} autoComplete="new-password" />
+          </Field>
+        </Group>
 
-            {/* Contact person for orgs */}
-            {isOrg && (
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Contact person <span className="text-red-500">*</span></label>
-                <input
-                  required
-                  value={form.contactPerson}
-                  onChange={(e) => setForm({ ...form, contactPerson: e.target.value })}
-                  className="block w-full px-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                  placeholder="Full name of the responsible officer"
-                />
-              </div>
-            )}
+        {/* Contact */}
+        <Group header="Contact" footer={isVolunteer ? 'Shown on your map profile so others can reach you.' : undefined}>
+          <Field label="Phone" htmlFor="phone">
+            <input id="phone" type="tel" required value={form.phone} onChange={set('phone')} placeholder="+255 7XX XXX XXX" className={inputClass} autoComplete="tel" />
+          </Field>
+          <Field label="WhatsApp" htmlFor="whatsapp">
+            <input id="whatsapp" type="tel" value={form.whatsapp} onChange={set('whatsapp')} placeholder="Optional" className={inputClass} />
+          </Field>
+          {isVolunteer && (
+            <Field label="LinkedIn" htmlFor="linkedin">
+              <input id="linkedin" type="url" value={form.linkedin} onChange={set('linkedin')} placeholder="Optional" className={inputClass} />
+            </Field>
+          )}
+        </Group>
 
-            {/* Email + password */}
-            <div className="grid md:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Email <span className="text-red-500">*</span></label>
-                <div className="relative">
-                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-                  <input
-                    required type="email" value={form.email}
-                    onChange={(e) => setForm({ ...form, email: e.target.value })}
-                    className="block w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                    placeholder="you@example.org"
-                  />
-                </div>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Password <span className="text-red-500">*</span></label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-                  <input
-                    required type="password" minLength={6} value={form.password}
-                    onChange={(e) => setForm({ ...form, password: e.target.value })}
-                    className="block w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                    placeholder="Min. 6 characters"
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Phone + WhatsApp */}
-            <div className="grid md:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Phone number <span className="text-red-500">*</span></label>
-                <div className="relative">
-                  <Phone className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-                  <input
-                    required type="tel" value={form.phone}
-                    onChange={(e) => setForm({ ...form, phone: e.target.value })}
-                    className="block w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                    placeholder="+255 7XX XXX XXX"
-                  />
-                </div>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">WhatsApp number</label>
-                <div className="relative">
-                  <MessageCircle className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-                  <input
-                    type="tel" value={form.whatsapp}
-                    onChange={(e) => setForm({ ...form, whatsapp: e.target.value })}
-                    className="block w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                    placeholder="Same as phone, or different"
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Volunteer extras: LinkedIn + profile photo */}
-            {isVolunteer && (
-              <div className="grid md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">LinkedIn profile</label>
-                  <div className="relative">
-                    <Linkedin className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-                    <input
-                      type="url" value={form.linkedin}
-                      onChange={(e) => setForm({ ...form, linkedin: e.target.value })}
-                      className="block w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                      placeholder="https://linkedin.com/in/yourname"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    {accountType === 'volunteer_group' ? 'Logo / photo' : 'Profile picture'}
-                  </label>
-                  <div className="flex items-center gap-3">
-                    <label className="flex-1 flex items-center gap-2 px-3 py-3 border border-dashed border-gray-300 rounded-lg cursor-pointer hover:border-emerald-500 text-sm text-gray-500">
-                      <Camera size={18} className="text-gray-400" />
-                      {photo ? 'Change photo' : 'Upload photo'}
-                      <input type="file" accept="image/*" onChange={handlePhoto} className="hidden" />
-                    </label>
-                    {photo && <img src={photo} alt="Profile preview" className="w-12 h-12 rounded-full object-cover border-2 border-emerald-500" />}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* MANDATORY LOCATION */}
-            <div className="border-t border-gray-200 pt-5">
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                <span className="inline-flex items-center gap-1.5"><MapPin size={16} className="text-emerald-600" />
-                  {accountType === 'municipal_council' ? 'Office location' : accountType === 'volunteer_group' ? 'Organization location' : 'Your location'} <span className="text-red-500">*</span>
+        {/* Photo (volunteers) */}
+        {isVolunteer && (
+          <Group header={accountType === 'volunteer_group' ? 'Logo' : 'Profile photo'}>
+            <label className="flex items-center gap-3 pr-4 py-2.5 cursor-pointer">
+              {photo ? (
+                <img src={photo} alt="Your photo" className="w-12 h-12 rounded-full object-cover" />
+              ) : (
+                <span className="w-12 h-12 rounded-full flex items-center justify-center" style={{ background: '#F2F2F7' }}>
+                  <Camera size={20} style={{ color: C.tertiary }} />
                 </span>
-              </label>
-              <p className="text-xs text-gray-500 mb-3">Tap the map to drop a pin, or use your current location. This is where you will appear on the network map.</p>
-              <div className="rounded-lg overflow-hidden border border-gray-300" style={{ height: '260px' }}>
-                <div ref={mapDivRef} style={{ height: '100%', width: '100%' }} />
-              </div>
-              <div className="flex flex-wrap items-center gap-3 mt-3">
-                <button type="button" onClick={useMyLocation}
-                  className="inline-flex items-center gap-2 text-sm font-medium text-emerald-700 border border-emerald-600 px-4 py-2 rounded-lg hover:bg-emerald-50 transition-colors">
-                  <LocateFixed size={16} /> Use my current location
-                </button>
-                {pin ? (
-                  <span className="inline-flex items-center gap-1.5 text-sm text-emerald-700 font-medium">
-                    <CheckCircle size={16} /> Pin set: {pin.lat.toFixed(4)}, {pin.lng.toFixed(4)}
+              )}
+              <span className="text-[17px]" style={{ color: C.tint }}>{photo ? 'Change photo' : 'Add a photo'}</span>
+              <span className="ml-auto text-[15px]" style={{ color: C.tertiary }}>Optional</span>
+              <input type="file" accept="image/*" onChange={handlePhoto} className="sr-only" />
+            </label>
+          </Group>
+        )}
+
+        {/* Location (required) */}
+        <div>
+          <p className="px-4 mb-1.5 text-[13px]" style={{ color: C.secondary }}>{copy.locationLabel}</p>
+          <div className="bg-white rounded-xl overflow-hidden isolate">
+            <div ref={mapDivRef} style={{ height: 240, width: '100%' }} aria-label="Map: tap to drop your pin" />
+            <div className="pl-4 divide-y divide-[#E5E5EA] border-t border-[#E5E5EA]">
+              <button
+                type="button"
+                onClick={locating ? stopLocating : useMyLocation}
+                className="w-full min-h-11 py-2 flex items-center justify-between gap-3 pr-4 text-[17px] text-left"
+              >
+                <span className="flex items-center gap-2" style={{ color: C.tint }}>
+                  <LocateFixed size={18} className={locating ? 'animate-pulse' : ''} />
+                  {locating ? 'Finding your location…' : pin && accuracy !== null ? 'Find me again' : 'Use my current location'}
+                </span>
+                {locating ? (
+                  <span className="text-[15px]" style={{ color: C.tertiary }}>Tap to stop</span>
+                ) : pin ? (
+                  <span className="flex items-center gap-1 text-[15px] whitespace-nowrap" style={{ color: C.green }}>
+                    <Check size={16} /> {accuracy !== null ? `Within ${formatAccuracy(accuracy)}` : 'Pin set'}
                   </span>
                 ) : (
-                  <span className="text-sm text-gray-400">No pin set yet</span>
+                  <span className="text-[15px]" style={{ color: C.tertiary }}>No pin yet</span>
                 )}
-              </div>
-              <div className="grid md:grid-cols-2 gap-4 mt-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Street / area address <span className="text-red-500">*</span></label>
-                  <input
-                    required value={form.address}
-                    onChange={(e) => setForm({ ...form, address: e.target.value })}
-                    className="block w-full px-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                    placeholder="e.g. Uhuru Street, Ilala"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Ward</label>
-                  <input
-                    value={form.ward}
-                    onChange={(e) => setForm({ ...form, ward: e.target.value })}
-                    className="block w-full px-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-transparent"
-                    placeholder="e.g. Kariakoo"
-                  />
-                </div>
-              </div>
+              </button>
+              <Field label="Address" htmlFor="address">
+                <input id="address" required value={form.address} onChange={set('address')} placeholder="Uhuru Street, Ilala" className={inputClass} autoComplete="street-address" />
+              </Field>
+              <Field label="Ward" htmlFor="ward">
+                <input id="ward" value={form.ward} onChange={set('ward')} placeholder="Optional" className={inputClass} />
+              </Field>
             </div>
-
-            {error && (
-              <div className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-3">
-                <AlertCircle size={17} /> {error}
-              </div>
-            )}
-
-            <button
-              type="submit" disabled={saving}
-              className="w-full bg-emerald-600 text-white py-3.5 rounded-lg font-semibold hover:bg-emerald-700 transition-colors disabled:opacity-60"
-            >
-              {saving ? 'Creating your account…' : 'Create account & appear on the map'}
-            </button>
-            <p className="text-center text-xs text-gray-400">
-              Your details are saved to the Kijani Hub network and will appear on the map for all users.
-            </p>
-          </form>
+          </div>
+          <p className="px-4 mt-1.5 text-[13px] leading-[1.4]" style={{ color: C.tertiary }}>
+            {accuracy !== null && accuracy > 200
+              ? 'Your device gave a rough position. Drag the pin onto your exact spot.'
+              : 'Tap the map, or drag the pin, to put it exactly where you are. This is where you’ll appear on the network map.'}
+          </p>
         </div>
+
+        {error && (
+          <p role="alert" className="px-1 flex items-start gap-1.5 text-[15px]" style={{ color: C.red }}>
+            <AlertCircle size={17} className="mt-[2px] flex-shrink-0" /> {error}
+          </p>
+        )}
+
+        <div>
+          <button
+            type="submit"
+            disabled={saving}
+            className="w-full h-12 rounded-xl text-[17px] font-semibold text-white transition-opacity disabled:opacity-60 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-[#1E8A5A]/25"
+            style={{ background: C.tint }}
+          >
+            {saving ? 'Creating your account…' : 'Create account'}
+          </button>
+          <p className="mt-3 px-2 text-center text-[13px] leading-[1.45] text-balance" style={{ color: C.tertiary }}>
+            Your details are saved to the Kijani Hub network. Your name, location and contact details will be visible to other members on the map.
+          </p>
+        </div>
+      </form>
+    </Shell>
+  );
+}
+
+// ── Pieces ───────────────────────────────────────────────────
+
+type Back = { label: string; to?: string; onClick?: () => void };
+
+function Shell({ back, children }: { back: Back; children: React.ReactNode }) {
+  const cls = 'inline-flex items-center gap-0.5 text-[17px]';
+  return (
+    <div className="min-h-screen bg-[#F5F5F7] antialiased" style={{ fontFamily: SYSTEM_FONT, color: C.label }}>
+      <div className="max-w-[1080px] mx-auto h-12 px-4 flex items-center">
+        {back.to ? (
+          <Link to={back.to} className={cls} style={{ color: C.tint }}><ChevronLeft size={22} strokeWidth={2} />{back.label}</Link>
+        ) : (
+          <button type="button" onClick={back.onClick} className={cls} style={{ color: C.tint }}><ChevronLeft size={22} strokeWidth={2} />{back.label}</button>
+        )}
       </div>
+      <main className="max-w-[520px] mx-auto px-4 pt-6 pb-16">{children}</main>
+    </div>
+  );
+}
+
+/** An iOS-style inset group with an optional header and footer */
+function Group({ header, footer, children }: { header?: string; footer?: string; children: React.ReactNode }) {
+  return (
+    <div>
+      {header && <p className="px-4 mb-1.5 text-[13px]" style={{ color: C.secondary }}>{header}</p>}
+      <div className="bg-white rounded-xl overflow-hidden">
+        <div className="pl-4 divide-y divide-[#E5E5EA]">{children}</div>
+      </div>
+      {footer && <p className="px-4 mt-1.5 text-[13px] leading-[1.4]" style={{ color: C.tertiary }}>{footer}</p>}
+    </div>
+  );
+}
+
+/** A form row: label on the left, input on the right */
+function Field({ label, htmlFor, children }: { label: string; htmlFor: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center gap-3 pr-4">
+      <label htmlFor={htmlFor} className="w-[118px] flex-shrink-0 text-[17px]">{label}</label>
+      {children}
     </div>
   );
 }

@@ -1,8 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { useApp } from '../context/AppContext';
-import { Trash2, Bug, Leaf, Flame, Droplets } from 'lucide-react';
+import { Trash2, Bug, Leaf, Flame, Droplets, LocateFixed } from 'lucide-react';
 import type { Member } from '../context/AppContext';
 
 /**
@@ -110,7 +110,75 @@ const buildMemberPopupHtml = (m: Member) => {
 };
 
 export default function MapView() {
-  const { devices, members } = useApp();
+  const { devices, members, currentMemberId, updateMemberLocation, authMode } = useApp();
+
+  // ── "Update my location": signed-in members can move their own pin ──
+  const me = authMode === 'real' ? members.find((m) => m.id === currentMemberId) : undefined;
+  const [locating, setLocating] = useState(false);
+  const [locMessage, setLocMessage] = useState<{ text: string; error?: boolean } | null>(null);
+  const watchIdRef = useRef<number | null>(null);
+  const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const stopWatching = () => {
+    if (watchIdRef.current !== null) navigator.geolocation?.clearWatch(watchIdRef.current);
+    watchIdRef.current = null;
+    if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+    stopTimerRef.current = null;
+  };
+  useEffect(() => stopWatching, []);
+
+  /** Find a precise position (refining for up to 15 s), then save it once */
+  const updateMyLocation = () => {
+    if (!me) return;
+    if (!('geolocation' in navigator) || !window.isSecureContext) {
+      setLocMessage({ text: 'This browser can’t share your location here.', error: true });
+      return;
+    }
+    stopWatching();
+    setLocating(true);
+    setLocMessage({ text: 'Finding your location…' });
+    let best: { lat: number; lng: number; acc: number } | null = null;
+
+    const finish = async () => {
+      stopWatching();
+      setLocating(false);
+      if (!best) return;
+      await updateMemberLocation(me.id, best.lat, best.lng);
+      mapRef.current?.flyTo([best.lat, best.lng], 16);
+      const acc = Math.round(best.acc);
+      setLocMessage({ text: `Your pin moved here, accurate to about ${acc < 1000 ? `${acc} m` : `${(acc / 1000).toFixed(1)} km`}.` });
+    };
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const { latitude, longitude, accuracy } = pos.coords;
+        if (best && accuracy >= best.acc) return;
+        best = { lat: latitude, lng: longitude, acc: accuracy };
+        setLocMessage({ text: `Finding your location… within ${Math.round(accuracy)} m so far` });
+        if (accuracy <= 25) finish();
+      },
+      (err) => {
+        // A passing hiccup after a good reading: keep refining until the timer or a precise reading
+        if (best && err.code !== 1) return;
+        if (best) { finish(); return; }
+        stopWatching();
+        setLocating(false);
+        const inPreview = window.self !== window.top;
+        setLocMessage({
+          error: true,
+          text: err.code === 1
+            ? inPreview
+              ? 'Location is blocked inside this preview window. Open your published site to use it.'
+              : 'Location access is off for this site. Allow it in your browser’s site settings and try again.'
+            : err.code === 3
+              ? 'Finding your location took too long. Try again near a window or outdoors.'
+              : 'Your device couldn’t work out where it is right now.',
+        });
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
+    stopTimerRef.current = setTimeout(finish, 15000);
+  };
   const mapDivRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const markersRef = useRef<L.LayerGroup | null>(null);
@@ -125,9 +193,11 @@ export default function MapView() {
       12
     );
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
       maxZoom: 19,
+      // OpenStreetMap blocks map requests that don't say which site they come from
+      referrerPolicy: 'strict-origin-when-cross-origin',
     }).addTo(map);
 
     markersRef.current = L.layerGroup().addTo(map);
@@ -226,6 +296,27 @@ export default function MapView() {
           </div>
         </div>
       </div>
+
+      {/* Your pin (signed-in members only) */}
+      {me && (
+        <div className="bg-white rounded-lg shadow-md p-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-gray-800">Your pin: {me.name}</p>
+            <p className={`text-sm ${locMessage?.error ? 'text-red-600' : 'text-gray-500'}`}>
+              {locMessage?.text ?? `Last updated ${new Date(me.lastSeen).toLocaleString()}`}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={locating ? () => { stopWatching(); setLocating(false); setLocMessage(null); } : updateMyLocation}
+            className="inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium text-white"
+            style={{ background: '#1E8A5A' }}
+          >
+            <LocateFixed size={16} className={locating ? 'animate-pulse' : ''} />
+            {locating ? 'Stop' : 'Update my location'}
+          </button>
+        </div>
+      )}
 
       {/* Map */}
       <div className="bg-white rounded-lg shadow-md overflow-hidden" style={{ height: '600px' }}>

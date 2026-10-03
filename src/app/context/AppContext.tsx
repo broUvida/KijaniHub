@@ -4,6 +4,8 @@ import {
   DeviceThroughput, DEFAULT_THROUGHPUT, totalThroughput,
 } from '../lib/conversionFactors';
 import { fetchAllMembers, insertMember, patchMemberLocation } from '../lib/membersApi';
+import { supabase } from '../lib/supabase';
+import type { Session } from '@supabase/supabase-js';
 import {
   fetchFactors, upsertFactor, resetAllFactors,
   fetchThroughput, upsertThroughput,
@@ -69,7 +71,15 @@ interface AppContextType {
   metrics: DashboardMetrics;
   isOnline: boolean;
   pendingSync: number;
-  logout: () => void;
+  logout: () => Promise<void>;
+  /** 'real' = Supabase account, 'demo' = one of the demo accounts, null = signed out */
+  authMode: 'demo' | 'real' | null;
+  /** true while a saved Supabase session is being restored on page load */
+  authLoading: boolean;
+  /** Re-read the Supabase session and apply the user's role (call after signing in) */
+  refreshSession: () => Promise<void>;
+  /** Start a demo session for one of the demo accounts */
+  startDemoSession: (role: UserRole, name: string) => void;
   members: Member[];
   addMember: (member: Member) => Promise<void>;
   updateMemberLocation: (id: string, lat: number, lng: number) => Promise<void>;
@@ -543,10 +553,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     );
   };
 
-  const logout = () => {
-    setIsAuthenticated(false);
-    setUserName('');
-  };
 
   // ─── Network members — backed by Supabase ───
   const [members, setMembers] = useState<Member[]>([]);
@@ -594,6 +600,111 @@ export function AppProvider({ children }: { children: ReactNode }) {
           : m
       )
     );
+  };
+
+  // ─── Authentication: real Supabase accounts + demo accounts ───
+  const [authMode, setAuthMode] = useState<'demo' | 'real' | null>(() => {
+    const saved = localStorage.getItem('authMode');
+    if (saved === 'demo' || saved === 'real') return saved;
+    return localStorage.getItem('isAuthenticated') === 'true' ? 'demo' : null;
+  });
+  const [authLoading, setAuthLoading] = useState(true);
+
+  const AUTH_KEYS = ['authMode', 'isAuthenticated', 'userRole', 'userName', 'kijani-current-member'];
+
+  /** Apply a Supabase session: load the user's role (profiles) and their map pin */
+  const applySession = async (session: Session | null) => {
+    if (!session) {
+      // Only clear state if the person was signed in with a real account
+      if (localStorage.getItem('authMode') === 'real') {
+        setIsAuthenticated(false);
+        setAuthMode(null);
+        setUserName('');
+        setCurrentMemberId(null);
+        AUTH_KEYS.forEach((k) => localStorage.removeItem(k));
+      }
+      return;
+    }
+    const uid = session.user.id;
+    const [{ data: profile }, { data: memberRow }] = await Promise.all([
+      supabase.from('profiles').select('role, full_name').eq('id', uid).maybeSingle(),
+      supabase.from('network_members').select('id, photo').eq('user_id', uid).maybeSingle(),
+    ]);
+    const role = ((profile?.role as UserRole) ?? 'volunteer');
+    const name = profile?.full_name || session.user.email || 'Member';
+
+    setUserRole(role);
+    setUserName(name);
+    setIsAuthenticated(true);
+    setAuthMode('real');
+    localStorage.setItem('authMode', 'real');
+    localStorage.setItem('isAuthenticated', 'true');
+    localStorage.setItem('userRole', role);
+    localStorage.setItem('userName', name);
+    if (memberRow?.id) {
+      setCurrentMemberId(memberRow.id);
+      localStorage.setItem('kijani-current-member', memberRow.id);
+    }
+
+    // A profile photo chosen at sign-up is uploaded on the first real sign-in
+    try {
+      const pending = JSON.parse(localStorage.getItem('kijani-pending-photo') || 'null');
+      if (
+        pending?.photo && memberRow?.id && !memberRow.photo &&
+        pending.email?.toLowerCase() === session.user.email?.toLowerCase()
+      ) {
+        await supabase.from('network_members').update({ photo: pending.photo }).eq('id', memberRow.id);
+        localStorage.removeItem('kijani-pending-photo');
+        fetchAllMembers().then(setMembers).catch(() => {});
+      }
+    } catch { /* photo upload is best-effort */ }
+  };
+
+  // Restore a saved session on load, and follow sign-in / sign-out events
+  useEffect(() => {
+    let active = true;
+    supabase.auth.getSession()
+      .then(({ data }) => applySession(data.session))
+      .catch(() => { /* offline: keep current state */ })
+      .finally(() => { if (active) setAuthLoading(false); });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      // Deferred, as Supabase recommends, so no other Supabase call runs inside this callback
+      setTimeout(() => {
+        if (event === 'SIGNED_OUT') applySession(null);
+        else if (['SIGNED_IN', 'TOKEN_REFRESHED', 'USER_UPDATED', 'PASSWORD_RECOVERY'].includes(event)) applySession(session);
+      }, 0);
+    });
+    return () => { active = false; sub.subscription.unsubscribe(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const refreshSession = async () => {
+    const { data } = await supabase.auth.getSession();
+    await applySession(data.session);
+  };
+
+  const startDemoSession = (role: UserRole, name: string) => {
+    setUserRole(role);
+    setUserName(name);
+    setIsAuthenticated(true);
+    setAuthMode('demo');
+    localStorage.setItem('authMode', 'demo');
+    localStorage.setItem('isAuthenticated', 'true');
+    localStorage.setItem('userRole', role);
+    localStorage.setItem('userName', name);
+  };
+
+  const logout = async () => {
+    const wasReal = localStorage.getItem('authMode') === 'real';
+    setIsAuthenticated(false);
+    setUserName('');
+    setAuthMode(null);
+    setCurrentMemberId(null);
+    AUTH_KEYS.forEach((k) => localStorage.removeItem(k));
+    if (wasReal) {
+      try { await supabase.auth.signOut(); } catch { /* already signed out */ }
+    }
   };
 
   // Load conversion engine data from Supabase on mount
@@ -684,6 +795,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
         isOnline,
         pendingSync,
         logout,
+        authMode,
+        authLoading,
+        refreshSession,
+        startDemoSession,
         members,
         addMember,
         updateMemberLocation,
